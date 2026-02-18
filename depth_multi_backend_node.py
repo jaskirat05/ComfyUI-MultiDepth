@@ -29,17 +29,21 @@ class Metric3Dv2DepthNode:
             },
             "optional": {
                 "focal_length_px": ("FLOAT", {"default": 1000.0, "min": 1.0, "max": 10000.0, "step": 1.0}),
-                "metric3d_variant": (
-                    ["metric3d_vit_small", "metric3d_vit_large", "metric3d_vit_giant2"],
+                "metric3d_model_name": (
+                    [
+                        "metric3d_convnext_tiny",
+                        "metric3d_convnext_large",
+                        "metric3d_vit_small",
+                        "metric3d_vit_large",
+                        "metric3d_vit_giant2",
+                    ],
                     {"default": "metric3d_vit_small"},
                 ),
-                "depth_models_root": ("STRING", {"default": ""}),
-                "metric3d_repo_dir": ("STRING", {"default": "Metric3D"}),
-                "metric3d_checkpoint": ("STRING", {"default": ""}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("depth_image", "normal_image")
     FUNCTION = "estimate"
     CATEGORY = "depth"
 
@@ -51,31 +55,30 @@ class Metric3Dv2DepthNode:
         min_depth_m,
         max_depth_m,
         focal_length_px=1000.0,
-        metric3d_variant="metric3d_vit_small",
-        depth_models_root="",
-        metric3d_repo_dir="Metric3D",
-        metric3d_checkpoint="",
+        metric3d_model_name="metric3d_vit_small",
     ):
         if max_depth_m <= min_depth_m:
             raise ValueError("max_depth_m must be greater than min_depth_m")
 
         device = _select_device()
-        return _estimate_batch(
-            image=image,
-            normalize_output=normalize_output,
-            invert_output=invert_output,
-            infer_fn=lambda rgb_uint8: _infer_metric3d(
+        images = image.detach().cpu()
+        depth_out = []
+        normal_out = []
+
+        for i in range(images.shape[0]):
+            rgb_uint8 = _comfy_frame_to_uint8(images[i])
+            depth, normal = _infer_metric3d_with_normal(
                 rgb_uint8=rgb_uint8,
                 device=device,
-                variant=metric3d_variant,
+                model_name=metric3d_model_name,
                 focal_length_px=focal_length_px,
-                depth_models_root=depth_models_root,
-                metric3d_repo_dir=metric3d_repo_dir,
-                metric3d_checkpoint=metric3d_checkpoint,
                 min_depth_m=min_depth_m,
                 max_depth_m=max_depth_m,
-            ),
-        )
+            )
+            depth_out.append(_depth_to_vis(depth, normalize_output=normalize_output, invert_output=invert_output))
+            normal_out.append(_normal_to_vis(normal, rgb_uint8.shape[0], rgb_uint8.shape[1]))
+
+        return (torch.stack(depth_out, dim=0), torch.stack(normal_out, dim=0))
 
 
 class UniDepthV2DepthNode:
@@ -90,8 +93,15 @@ class UniDepthV2DepthNode:
                 "max_depth_m": ("FLOAT", {"default": 80.0, "min": 0.01, "max": 10000.0, "step": 0.1}),
             },
             "optional": {
-                "depth_models_root": ("STRING", {"default": ""}),
-                "unidepth_model_id": ("STRING", {"default": "unidepth-v2-vitl14"}),
+                "unidepth_model_name": (
+                    [
+                        "unidepth-v1-cnvnxtl",
+                        "unidepth-v1-vitl14",
+                        "unidepth-v2-vits14",
+                        "unidepth-v2-vitl14",
+                    ],
+                    {"default": "unidepth-v2-vitl14"},
+                ),
             },
         }
 
@@ -106,8 +116,7 @@ class UniDepthV2DepthNode:
         invert_output,
         min_depth_m,
         max_depth_m,
-        depth_models_root="",
-        unidepth_model_id="unidepth-v2-vitl14",
+        unidepth_model_name="unidepth-v2-vitl14",
     ):
         if max_depth_m <= min_depth_m:
             raise ValueError("max_depth_m must be greater than min_depth_m")
@@ -119,8 +128,7 @@ class UniDepthV2DepthNode:
             infer_fn=lambda rgb_uint8: _infer_unidepth(
                 rgb_uint8=rgb_uint8,
                 device=device,
-                model_id=unidepth_model_id,
-                depth_models_root=depth_models_root,
+                model_name=unidepth_model_name,
                 min_depth_m=min_depth_m,
                 max_depth_m=max_depth_m,
             ),
@@ -223,6 +231,21 @@ def _depth_to_vis(depth: torch.Tensor, normalize_output: bool, invert_output: bo
     return norm.unsqueeze(-1).repeat(1, 1, 3)
 
 
+def _normal_to_vis(normal: Optional[torch.Tensor], target_h: int, target_w: int) -> torch.Tensor:
+    if normal is None:
+        # Fallback for models that do not predict normals (e.g., convnext variants).
+        return torch.zeros((target_h, target_w, 3), dtype=torch.float32)
+
+    if normal.ndim == 4:
+        normal = normal[0]
+    if normal.ndim != 3 or normal.shape[0] != 3:
+        raise RuntimeError(f"Expected normal tensor shape [3, H, W], got {tuple(normal.shape)}")
+
+    # Model output normals are typically in [-1, 1]. Map to [0, 1].
+    vis = ((normal.permute(1, 2, 0) + 1.0) * 0.5).clamp(0.0, 1.0)
+    return vis
+
+
 def _cache_key(*parts: str) -> str:
     return "::".join(parts)
 
@@ -240,29 +263,19 @@ def _get_or_load_model(key: str, loader):
     return model
 
 
-def _infer_metric3d(
+def _infer_metric3d_with_normal(
     rgb_uint8: np.ndarray,
     device: torch.device,
-    variant: str,
+    model_name: str,
     focal_length_px: float,
-    depth_models_root: str,
-    metric3d_repo_dir: str,
-    metric3d_checkpoint: str,
     min_depth_m: float,
     max_depth_m: float,
-) -> torch.Tensor:
-    key = _cache_key("metric3d", variant, str(device), depth_models_root, metric3d_repo_dir, metric3d_checkpoint)
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    key = _cache_key("metric3d", model_name, str(device))
 
     def _loader():
-        repo_dir = _resolve_local_model_path(metric3d_repo_dir, depth_models_root, expect_dir=True)
         try:
-            model = torch.hub.load(
-                str(repo_dir),
-                variant,
-                pretrain=False,
-                source="local",
-                trust_repo=True,
-            )
+            model = torch.hub.load("yvanyin/metric3d", model_name, pretrain=True, trust_repo=True)
         except ModuleNotFoundError as exc:
             missing = getattr(exc, "name", "")
             if missing in {"mmengine", "mmcv", "mmcv._ext"}:
@@ -271,30 +284,13 @@ def _infer_metric3d(
                     "pip install mmengine mmcv-lite"
                 ) from exc
             raise
-
-        ckpt_path = _resolve_metric3d_checkpoint(
-            variant=variant,
-            depth_models_root=depth_models_root,
-            metric3d_repo_dir=metric3d_repo_dir,
-            metric3d_checkpoint=metric3d_checkpoint,
-        )
-        state = torch.load(str(ckpt_path), map_location="cpu")
-        state_dict = state
-        if isinstance(state, dict):
-            for key_name in ("state_dict", "model", "model_state_dict"):
-                if key_name in state and isinstance(state[key_name], dict):
-                    state_dict = state[key_name]
-                    break
-        if not isinstance(state_dict, dict):
-            raise RuntimeError(f"Unsupported Metric3D checkpoint format: {ckpt_path}")
-        model.load_state_dict(state_dict, strict=False)
         model.to(device).eval()
         return model
 
     model = _get_or_load_model(key, _loader)
 
     h, w, _ = rgb_uint8.shape
-    input_size = (616, 1064)
+    input_size = (616, 1064) if "vit" in model_name else (544, 1216)
 
     img = torch.from_numpy(rgb_uint8).permute(2, 0, 1).float()
 
@@ -318,7 +314,7 @@ def _infer_metric3d(
     norm = (canvas - _METRIC_MEAN) / _METRIC_STD
 
     with torch.no_grad():
-        pred_depth, _, _ = model.inference({"input": norm.unsqueeze(0).to(device)})
+        pred_depth, _, output_dict = model.inference({"input": norm.unsqueeze(0).to(device)})
 
     pred_depth = pred_depth.squeeze()
     pred_depth = pred_depth[top : top + new_h, left : left + new_w]
@@ -331,44 +327,64 @@ def _infer_metric3d(
 
     scaled_focal = focal_length_px * scale
     pred_depth = pred_depth * (scaled_focal / 1000.0)
-    return pred_depth.clamp(min_depth_m, max_depth_m).cpu()
+    pred_depth = pred_depth.clamp(min_depth_m, max_depth_m).cpu()
+
+    pred_normal = None
+    if isinstance(output_dict, dict) and "prediction_normal" in output_dict:
+        normal = output_dict["prediction_normal"][:, :3, :, :].squeeze(0)  # 3 x H x W
+        normal = normal[
+            :,
+            top : top + new_h,
+            left : left + new_w,
+        ]
+        normal = F.interpolate(
+            normal.unsqueeze(0),
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        pred_normal = normal.cpu()
+
+    return pred_depth, pred_normal
 
 
 def _infer_unidepth(
     rgb_uint8: np.ndarray,
     device: torch.device,
-    model_id: str,
-    depth_models_root: str,
+    model_name: str,
     min_depth_m: float,
     max_depth_m: float,
 ) -> torch.Tensor:
-    key = _cache_key("unidepth_v2", model_id, str(device), depth_models_root)
+    key = _cache_key("unidepth", model_name, str(device))
 
     def _loader():
         try:
-            from unidepth.models import UniDepthV2
+            from unidepth.models import UniDepthV1, UniDepthV2
         except Exception as exc:
             raise RuntimeError(
                 "UniDepth import failed. Install with: pip install unidepth"
             ) from exc
 
-        local_model_path = _resolve_local_model_path(model_id, depth_models_root, expect_dir=True)
-        model = UniDepthV2.from_pretrained(str(local_model_path), local_files_only=True)
-        model.to(device).eval()
+        if model_name.startswith("unidepth-v1-"):
+            model = UniDepthV1.from_pretrained(f"lpiccinelli/{model_name}")
+        else:
+            model = UniDepthV2.from_pretrained(f"lpiccinelli/{model_name}")
+
+        model = model.to(device)
+        model.eval()
         return model
 
     model = _get_or_load_model(key, _loader)
 
-    rgb = torch.from_numpy(rgb_uint8).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-    rgb = rgb.to(device)
+    rgb = torch.from_numpy(rgb_uint8).permute(2, 0, 1).to(device)
 
     with torch.no_grad():
-        try:
-            outputs = model.infer(rgb)
-        except Exception:
-            outputs = model(rgb)
+        predictions = model.infer(rgb)
 
-    depth = _extract_depth_tensor(outputs)
+    if not isinstance(predictions, dict) or "depth" not in predictions:
+        raise RuntimeError("UniDepth predictions missing 'depth' key.")
+
+    depth = predictions["depth"]
     if depth is None:
         raise RuntimeError("UniDepth output did not contain a recognizable depth tensor.")
 
@@ -735,7 +751,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Metric3Dv2DepthNode": "Depth - Metric3Dv2 (Local)",
-    "UniDepthV2DepthNode": "Depth - UniDepthV2 (Local)",
+    "Metric3Dv2DepthNode": "Depth - Metric3D (Zoo)",
+    "UniDepthV2DepthNode": "Depth - UniDepth (Zoo)",
     "DepthLMDepthNode": "Depth - DepthLM (Local)",
 }
