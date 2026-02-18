@@ -1,10 +1,11 @@
 import threading
-from typing import Any, Dict, Optional, Tuple
+import re
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 _MODEL_CACHE: Dict[str, Any] = {}
@@ -36,7 +37,9 @@ class MultiDepthEstimateNode:
                     {"default": "metric3d_vit_small"},
                 ),
                 "unidepth_model_id": ("STRING", {"default": "lpiccinelli/unidepth-v2-vitl14"}),
-                "facebook_model_id": ("STRING", {"default": "facebook/map-anything"}),
+                "facebook_model_id": ("STRING", {"default": "facebook/DepthLM"}),
+                "depthlm_point_x": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "depthlm_point_y": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
             },
         }
 
@@ -55,7 +58,9 @@ class MultiDepthEstimateNode:
         focal_length_px=1000.0,
         metric3d_variant="metric3d_vit_small",
         unidepth_model_id="lpiccinelli/unidepth-v2-vitl14",
-        facebook_model_id="facebook/map-anything",
+        facebook_model_id="facebook/DepthLM",
+        depthlm_point_x=0.5,
+        depthlm_point_y=0.5,
     ):
         if max_depth_m <= min_depth_m:
             raise ValueError("max_depth_m must be greater than min_depth_m")
@@ -89,6 +94,8 @@ class MultiDepthEstimateNode:
                     rgb_uint8=rgb_uint8,
                     device=device,
                     model_id=facebook_model_id,
+                    point_x=depthlm_point_x,
+                    point_y=depthlm_point_y,
                     min_depth_m=min_depth_m,
                     max_depth_m=max_depth_m,
                 )
@@ -157,7 +164,16 @@ def _infer_metric3d(
     key = _cache_key("metric3d", variant, str(device))
 
     def _loader():
-        model = torch.hub.load("YvanYin/Metric3D", variant, pretrain=True, trust_repo=True)
+        try:
+            model = torch.hub.load("YvanYin/Metric3D", variant, pretrain=True, trust_repo=True)
+        except ModuleNotFoundError as exc:
+            missing = getattr(exc, "name", "")
+            if missing in {"mmengine", "mmcv", "mmcv._ext"}:
+                raise RuntimeError(
+                    "Metric3Dv2 dependencies missing. Install in ComfyUI env with: "
+                    "pip install mmengine mmcv-lite"
+                ) from exc
+            raise
         model.to(device).eval()
         return model
 
@@ -248,6 +264,8 @@ def _infer_facebook_depth_lm(
     rgb_uint8: np.ndarray,
     device: torch.device,
     model_id: str,
+    point_x: float,
+    point_y: float,
     min_depth_m: float,
     max_depth_m: float,
 ) -> torch.Tensor:
@@ -255,18 +273,14 @@ def _infer_facebook_depth_lm(
 
     def _loader():
         try:
-            from transformers import AutoModel, AutoModelForDepthEstimation, AutoProcessor
+            from transformers import AutoProcessor
         except Exception as exc:
             raise RuntimeError(
                 "Transformers import failed. Install with: pip install transformers"
             ) from exc
 
         processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-
-        try:
-            model = AutoModelForDepthEstimation.from_pretrained(model_id, trust_remote_code=True)
-        except Exception:
-            model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+        model = _load_depthlm_text_model(model_id, device)
 
         model.to(device).eval()
         return processor, model
@@ -274,35 +288,173 @@ def _infer_facebook_depth_lm(
     processor, model = _get_or_load_model(key, _loader)
 
     pil_img = Image.fromarray(rgb_uint8)
-    inputs = processor(images=pil_img, return_tensors="pt")
+    marked_image = _draw_depthlm_arrow_marker(pil_img, point_x, point_y)
+    prompt = (
+        "Given this image, how far is the point pointed by the red arrow from the camera? "
+        "Output the meter number only."
+    )
+
+    model_path_lower = model_id.lower()
+    text_output = _generate_depthlm_text(
+        model=model,
+        processor=processor,
+        image=marked_image,
+        prompt=prompt,
+        is_pixtral=("pixtral" in model_path_lower or "depthlm" in model_path_lower),
+        device=device,
+    )
+
+    point_depth = _extract_float(text_output)
+    if point_depth is None:
+        raise RuntimeError(
+            "DepthLM response did not contain a parseable numeric depth value. "
+            f"Response: {text_output!r}"
+        )
+
+    point_depth = float(np.clip(point_depth, min_depth_m, max_depth_m))
+    h, w, _ = rgb_uint8.shape
+    depth = torch.full((h, w), point_depth, dtype=torch.float32)
+    return depth
+
+
+def _load_depthlm_text_model(model_id: str, device: torch.device):
+    try:
+        from transformers import (
+            AutoModelForImageTextToText,
+            LlavaForConditionalGeneration,
+            Qwen2_5_VLForConditionalGeneration,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not import DepthLM model classes from transformers."
+        ) from exc
+
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model_path_lower = model_id.lower()
+
+    if "pixtral" in model_path_lower or "depthlm" in model_path_lower:
+        try:
+            return LlavaForConditionalGeneration.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
+        except Exception:
+            pass
+
+    if "qwen" in model_path_lower:
+        try:
+            return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
+        except Exception:
+            pass
+
+    return AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+    )
+
+
+def _draw_depthlm_arrow_marker(image: Image.Image, point_x: float, point_y: float) -> Image.Image:
+    w, h = image.size
+    px = int(np.clip(point_x, 0.0, 1.0) * (w - 1))
+    py = int(np.clip(point_y, 0.0, 1.0) * (h - 1))
+
+    out = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(out)
+
+    arrow_len = max(16, int(min(w, h) * 0.12))
+    start_x = max(0, px - arrow_len)
+    start_y = max(0, py - arrow_len)
+    draw.line((start_x, start_y, px, py), fill=(255, 0, 0), width=max(2, arrow_len // 16))
+
+    head = max(6, arrow_len // 4)
+    draw.polygon(
+        [
+            (px, py),
+            (max(0, px - head), max(0, py - head // 2)),
+            (max(0, px - head // 2), max(0, py - head)),
+        ],
+        fill=(255, 0, 0),
+    )
+    draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(255, 0, 0))
+    return out
+
+
+def _generate_depthlm_text(model, processor, image: Image.Image, prompt: str, is_pixtral: bool, device: torch.device) -> str:
+    if is_pixtral:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "content": prompt},
+                ],
+            }
+        ]
+        inputs = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+    else:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image", "image": image},
+                ],
+            }
+        ]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], images=[image], return_tensors="pt")
+
     model_inputs = {
         k: (v.to(device) if isinstance(v, torch.Tensor) else v)
         for k, v in inputs.items()
     }
 
     with torch.no_grad():
-        try:
-            outputs = model(**model_inputs)
-        except TypeError:
-            # Some trust_remote_code models expose custom infer signatures.
-            if hasattr(model, "infer"):
-                outputs = model.infer(**model_inputs)
-            else:
-                raise
-
-    depth = _extract_depth_tensor(outputs)
-    if depth is None and hasattr(model, "infer"):
-        with torch.no_grad():
-            depth = _extract_depth_tensor(model.infer(**model_inputs))
-
-    if depth is None:
-        raise RuntimeError(
-            "Depth tensor not found for Facebook depth LM output. "
-            "Try a different model_id or ensure the model supports image depth inference."
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=64,
+            do_sample=False,
+            top_p=None,
+            top_k=None,
         )
 
-    depth = _ensure_hw(depth, rgb_uint8.shape[0], rgb_uint8.shape[1])
-    return depth.clamp(min_depth_m, max_depth_m).cpu()
+    input_ids = model_inputs.get("input_ids", None)
+    if input_ids is not None and isinstance(input_ids, torch.Tensor):
+        trimmed = generated_ids[:, input_ids.shape[-1] :]
+    else:
+        trimmed = generated_ids
+
+    decoded = processor.batch_decode(
+        trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    return decoded[0] if decoded else ""
+
+
+def _extract_float(text: str) -> Optional[float]:
+    if not text:
+        return None
+
+    match = re.search(r"[-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
 
 
 def _extract_depth_tensor(outputs: Any) -> Optional[torch.Tensor]:

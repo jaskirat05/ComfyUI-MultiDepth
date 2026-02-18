@@ -2,4 +2,6 @@ torch
 numpy
 Pillow
 transformers
-unidepth
+unidepth @ git+https://github.com/lpiccinelli-eth/UniDepth.git
+mmengine
+mmcv-lite
