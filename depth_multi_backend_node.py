@@ -1,5 +1,6 @@
 import threading
 import re
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -15,16 +16,12 @@ _METRIC_MEAN = torch.tensor([123.675, 116.28, 103.53], dtype=torch.float32).view
 _METRIC_STD = torch.tensor([58.395, 57.12, 57.375], dtype=torch.float32).view(3, 1, 1)
 
 
-class MultiDepthEstimateNode:
+class Metric3Dv2DepthNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "backend": (
-                    ["metric3dv2", "unidepth_v2", "facebook_depth_lm"],
-                    {"default": "metric3dv2"},
-                ),
                 "normalize_output": ("BOOLEAN", {"default": True}),
                 "invert_output": ("BOOLEAN", {"default": False}),
                 "min_depth_m": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1000.0, "step": 0.01}),
@@ -36,10 +33,9 @@ class MultiDepthEstimateNode:
                     ["metric3d_vit_small", "metric3d_vit_large", "metric3d_vit_giant2"],
                     {"default": "metric3d_vit_small"},
                 ),
-                "unidepth_model_id": ("STRING", {"default": "lpiccinelli/unidepth-v2-vitl14"}),
-                "facebook_model_id": ("STRING", {"default": "facebook/DepthLM"}),
-                "depthlm_point_x": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
-                "depthlm_point_y": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "depth_models_root": ("STRING", {"default": ""}),
+                "metric3d_repo_dir": ("STRING", {"default": "Metric3D"}),
+                "metric3d_checkpoint": ("STRING", {"default": ""}),
             },
         }
 
@@ -50,60 +46,151 @@ class MultiDepthEstimateNode:
     def estimate(
         self,
         image,
-        backend,
         normalize_output,
         invert_output,
         min_depth_m,
         max_depth_m,
         focal_length_px=1000.0,
         metric3d_variant="metric3d_vit_small",
-        unidepth_model_id="lpiccinelli/unidepth-v2-vitl14",
-        facebook_model_id="facebook/DepthLM",
-        depthlm_point_x=0.5,
-        depthlm_point_y=0.5,
+        depth_models_root="",
+        metric3d_repo_dir="Metric3D",
+        metric3d_checkpoint="",
     ):
         if max_depth_m <= min_depth_m:
             raise ValueError("max_depth_m must be greater than min_depth_m")
 
         device = _select_device()
-        images = image.detach().cpu()
-        out = []
+        return _estimate_batch(
+            image=image,
+            normalize_output=normalize_output,
+            invert_output=invert_output,
+            infer_fn=lambda rgb_uint8: _infer_metric3d(
+                rgb_uint8=rgb_uint8,
+                device=device,
+                variant=metric3d_variant,
+                focal_length_px=focal_length_px,
+                depth_models_root=depth_models_root,
+                metric3d_repo_dir=metric3d_repo_dir,
+                metric3d_checkpoint=metric3d_checkpoint,
+                min_depth_m=min_depth_m,
+                max_depth_m=max_depth_m,
+            ),
+        )
 
-        for i in range(images.shape[0]):
-            rgb_uint8 = _comfy_frame_to_uint8(images[i])
 
-            if backend == "metric3dv2":
-                depth = _infer_metric3d(
-                    rgb_uint8=rgb_uint8,
-                    device=device,
-                    variant=metric3d_variant,
-                    focal_length_px=focal_length_px,
-                    min_depth_m=min_depth_m,
-                    max_depth_m=max_depth_m,
-                )
-            elif backend == "unidepth_v2":
-                depth = _infer_unidepth(
-                    rgb_uint8=rgb_uint8,
-                    device=device,
-                    model_id=unidepth_model_id,
-                    min_depth_m=min_depth_m,
-                    max_depth_m=max_depth_m,
-                )
-            else:
-                depth = _infer_facebook_depth_lm(
-                    rgb_uint8=rgb_uint8,
-                    device=device,
-                    model_id=facebook_model_id,
-                    point_x=depthlm_point_x,
-                    point_y=depthlm_point_y,
-                    min_depth_m=min_depth_m,
-                    max_depth_m=max_depth_m,
-                )
+class UniDepthV2DepthNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "normalize_output": ("BOOLEAN", {"default": True}),
+                "invert_output": ("BOOLEAN", {"default": False}),
+                "min_depth_m": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "max_depth_m": ("FLOAT", {"default": 80.0, "min": 0.01, "max": 10000.0, "step": 0.1}),
+            },
+            "optional": {
+                "depth_models_root": ("STRING", {"default": ""}),
+                "unidepth_model_id": ("STRING", {"default": "unidepth-v2-vitl14"}),
+            },
+        }
 
-            depth_vis = _depth_to_vis(depth, normalize_output=normalize_output, invert_output=invert_output)
-            out.append(depth_vis)
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "estimate"
+    CATEGORY = "depth"
 
-        return (torch.stack(out, dim=0),)
+    def estimate(
+        self,
+        image,
+        normalize_output,
+        invert_output,
+        min_depth_m,
+        max_depth_m,
+        depth_models_root="",
+        unidepth_model_id="unidepth-v2-vitl14",
+    ):
+        if max_depth_m <= min_depth_m:
+            raise ValueError("max_depth_m must be greater than min_depth_m")
+        device = _select_device()
+        return _estimate_batch(
+            image=image,
+            normalize_output=normalize_output,
+            invert_output=invert_output,
+            infer_fn=lambda rgb_uint8: _infer_unidepth(
+                rgb_uint8=rgb_uint8,
+                device=device,
+                model_id=unidepth_model_id,
+                depth_models_root=depth_models_root,
+                min_depth_m=min_depth_m,
+                max_depth_m=max_depth_m,
+            ),
+        )
+
+
+class DepthLMDepthNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "normalize_output": ("BOOLEAN", {"default": True}),
+                "invert_output": ("BOOLEAN", {"default": False}),
+                "min_depth_m": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "max_depth_m": ("FLOAT", {"default": 80.0, "min": 0.01, "max": 10000.0, "step": 0.1}),
+                "depthlm_point_x": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "depthlm_point_y": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
+            },
+            "optional": {
+                "depth_models_root": ("STRING", {"default": ""}),
+                "facebook_model_id": ("STRING", {"default": "DepthLM"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "estimate"
+    CATEGORY = "depth"
+
+    def estimate(
+        self,
+        image,
+        normalize_output,
+        invert_output,
+        min_depth_m,
+        max_depth_m,
+        depthlm_point_x,
+        depthlm_point_y,
+        depth_models_root="",
+        facebook_model_id="DepthLM",
+    ):
+        if max_depth_m <= min_depth_m:
+            raise ValueError("max_depth_m must be greater than min_depth_m")
+        device = _select_device()
+        return _estimate_batch(
+            image=image,
+            normalize_output=normalize_output,
+            invert_output=invert_output,
+            infer_fn=lambda rgb_uint8: _infer_facebook_depth_lm(
+                rgb_uint8=rgb_uint8,
+                device=device,
+                model_id=facebook_model_id,
+                depth_models_root=depth_models_root,
+                point_x=depthlm_point_x,
+                point_y=depthlm_point_y,
+                min_depth_m=min_depth_m,
+                max_depth_m=max_depth_m,
+            ),
+        )
+
+
+def _estimate_batch(image, normalize_output: bool, invert_output: bool, infer_fn):
+    images = image.detach().cpu()
+    out = []
+    for i in range(images.shape[0]):
+        rgb_uint8 = _comfy_frame_to_uint8(images[i])
+        depth = infer_fn(rgb_uint8)
+        depth_vis = _depth_to_vis(depth, normalize_output=normalize_output, invert_output=invert_output)
+        out.append(depth_vis)
+    return (torch.stack(out, dim=0),)
 
 
 def _select_device() -> torch.device:
@@ -158,14 +245,24 @@ def _infer_metric3d(
     device: torch.device,
     variant: str,
     focal_length_px: float,
+    depth_models_root: str,
+    metric3d_repo_dir: str,
+    metric3d_checkpoint: str,
     min_depth_m: float,
     max_depth_m: float,
 ) -> torch.Tensor:
-    key = _cache_key("metric3d", variant, str(device))
+    key = _cache_key("metric3d", variant, str(device), depth_models_root, metric3d_repo_dir, metric3d_checkpoint)
 
     def _loader():
+        repo_dir = _resolve_local_model_path(metric3d_repo_dir, depth_models_root, expect_dir=True)
         try:
-            model = torch.hub.load("YvanYin/Metric3D", variant, pretrain=True, trust_repo=True)
+            model = torch.hub.load(
+                str(repo_dir),
+                variant,
+                pretrain=False,
+                source="local",
+                trust_repo=True,
+            )
         except ModuleNotFoundError as exc:
             missing = getattr(exc, "name", "")
             if missing in {"mmengine", "mmcv", "mmcv._ext"}:
@@ -174,6 +271,23 @@ def _infer_metric3d(
                     "pip install mmengine mmcv-lite"
                 ) from exc
             raise
+
+        ckpt_path = _resolve_metric3d_checkpoint(
+            variant=variant,
+            depth_models_root=depth_models_root,
+            metric3d_repo_dir=metric3d_repo_dir,
+            metric3d_checkpoint=metric3d_checkpoint,
+        )
+        state = torch.load(str(ckpt_path), map_location="cpu")
+        state_dict = state
+        if isinstance(state, dict):
+            for key_name in ("state_dict", "model", "model_state_dict"):
+                if key_name in state and isinstance(state[key_name], dict):
+                    state_dict = state[key_name]
+                    break
+        if not isinstance(state_dict, dict):
+            raise RuntimeError(f"Unsupported Metric3D checkpoint format: {ckpt_path}")
+        model.load_state_dict(state_dict, strict=False)
         model.to(device).eval()
         return model
 
@@ -224,10 +338,11 @@ def _infer_unidepth(
     rgb_uint8: np.ndarray,
     device: torch.device,
     model_id: str,
+    depth_models_root: str,
     min_depth_m: float,
     max_depth_m: float,
 ) -> torch.Tensor:
-    key = _cache_key("unidepth_v2", model_id, str(device))
+    key = _cache_key("unidepth_v2", model_id, str(device), depth_models_root)
 
     def _loader():
         try:
@@ -237,7 +352,8 @@ def _infer_unidepth(
                 "UniDepth import failed. Install with: pip install unidepth"
             ) from exc
 
-        model = UniDepthV2.from_pretrained(model_id)
+        local_model_path = _resolve_local_model_path(model_id, depth_models_root, expect_dir=True)
+        model = UniDepthV2.from_pretrained(str(local_model_path), local_files_only=True)
         model.to(device).eval()
         return model
 
@@ -264,12 +380,13 @@ def _infer_facebook_depth_lm(
     rgb_uint8: np.ndarray,
     device: torch.device,
     model_id: str,
+    depth_models_root: str,
     point_x: float,
     point_y: float,
     min_depth_m: float,
     max_depth_m: float,
 ) -> torch.Tensor:
-    key = _cache_key("facebook_depth_lm", model_id, str(device))
+    key = _cache_key("facebook_depth_lm", model_id, str(device), depth_models_root)
 
     def _loader():
         try:
@@ -279,8 +396,13 @@ def _infer_facebook_depth_lm(
                 "Transformers import failed. Install with: pip install transformers"
             ) from exc
 
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        model = _load_depthlm_text_model(model_id, device)
+        local_model_path = _resolve_local_model_path(model_id, depth_models_root, expect_dir=True)
+        processor = AutoProcessor.from_pretrained(
+            str(local_model_path),
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        model = _load_depthlm_text_model(str(local_model_path), device)
 
         model.to(device).eval()
         return processor, model
@@ -338,6 +460,7 @@ def _load_depthlm_text_model(model_id: str, device: torch.device):
                 model_id,
                 torch_dtype=dtype,
                 trust_remote_code=True,
+                local_files_only=True,
             )
         except Exception:
             pass
@@ -348,6 +471,7 @@ def _load_depthlm_text_model(model_id: str, device: torch.device):
                 model_id,
                 torch_dtype=dtype,
                 trust_remote_code=True,
+                local_files_only=True,
             )
         except Exception:
             pass
@@ -356,6 +480,81 @@ def _load_depthlm_text_model(model_id: str, device: torch.device):
         model_id,
         torch_dtype=dtype,
         trust_remote_code=True,
+        local_files_only=True,
+    )
+
+
+def _default_depth_models_root() -> Path:
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parent / "models" / "depth_models",
+        here.parent.parent / "models" / "depth_models",
+        here.parent.parent.parent / "models" / "depth_models",
+        Path.cwd() / "models" / "depth_models",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[2]
+
+
+def _resolve_local_model_path(name_or_path: str, depth_models_root: str, expect_dir: bool) -> Path:
+    raw = (name_or_path or "").strip()
+    if not raw:
+        raise RuntimeError("Empty local model path provided.")
+
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        base = Path(depth_models_root).expanduser() if (depth_models_root or "").strip() else _default_depth_models_root()
+        p = (base / raw).resolve()
+
+    if not p.exists():
+        raise RuntimeError(
+            f"Local model path not found: {p}. "
+            "Place models under models/depth_models or set depth_models_root."
+        )
+    if expect_dir and not p.is_dir():
+        raise RuntimeError(f"Expected directory for model path, got file: {p}")
+    return p
+
+
+def _resolve_metric3d_checkpoint(
+    variant: str,
+    depth_models_root: str,
+    metric3d_repo_dir: str,
+    metric3d_checkpoint: str,
+) -> Path:
+    if (metric3d_checkpoint or "").strip():
+        p = Path(metric3d_checkpoint).expanduser()
+        if not p.is_absolute():
+            base = Path(depth_models_root).expanduser() if (depth_models_root or "").strip() else _default_depth_models_root()
+            p = (base / metric3d_checkpoint).resolve()
+        if not p.exists():
+            raise RuntimeError(f"Metric3D checkpoint not found: {p}")
+        return p
+
+    base = Path(depth_models_root).expanduser() if (depth_models_root or "").strip() else _default_depth_models_root()
+    repo_dir = _resolve_local_model_path(metric3d_repo_dir, depth_models_root, expect_dir=True)
+    search_roots = [base, repo_dir, repo_dir / "checkpoints", repo_dir / "weights"]
+    patterns = [
+        f"{variant}*.pth",
+        f"{variant}*.pt",
+        f"*{variant}*.pth",
+        f"*{variant}*.pt",
+        "*.pth",
+        "*.pt",
+    ]
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for pat in patterns:
+            found = sorted(root.glob(pat))
+            if found:
+                return found[0]
+
+    raise RuntimeError(
+        "Metric3D checkpoint not found locally. Set metric3d_checkpoint explicitly, "
+        "or place weights under models/depth_models."
     )
 
 
@@ -530,9 +729,13 @@ def _ensure_hw(depth: torch.Tensor, target_h: int, target_w: int) -> torch.Tenso
 
 
 NODE_CLASS_MAPPINGS = {
-    "MultiDepthEstimateNode": MultiDepthEstimateNode,
+    "Metric3Dv2DepthNode": Metric3Dv2DepthNode,
+    "UniDepthV2DepthNode": UniDepthV2DepthNode,
+    "DepthLMDepthNode": DepthLMDepthNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MultiDepthEstimateNode": "Depth Estimate (Metric3Dv2 / UniDepthV2 / Facebook LM)",
+    "Metric3Dv2DepthNode": "Depth - Metric3Dv2 (Local)",
+    "UniDepthV2DepthNode": "Depth - UniDepthV2 (Local)",
+    "DepthLMDepthNode": "Depth - DepthLM (Local)",
 }
